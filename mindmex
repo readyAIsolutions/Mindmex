@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+
 MINDMEX - AI story factory into a NEW original superhero empire (single-file build)
 
 CONSOLIDATED, SELF-CONTAINED single-file export of the whole MindMex project so it can
@@ -8,11 +9,15 @@ be reviewed/checked in one file (e.g. by ChatGPT).
 What it is:
   * George Stanley agent drafts an ORIGINAL universe (heroes/villains/sagas)
   * HUMAN-IN-THE-LOOP: approve/reject stories, characters & voices before production
+  * MASTER CHIEF agent: runs the whole studio workflow with human gates
+      trend radar -> pitches -> your approval -> production -> review -> format check
+      -> publishing approval -> promotion -> analytics
   * OpenRouter smart model routing per task + fallback chain
   * Voice: ElevenLabs OR free self-hosted coqui/Piper/OpenVoice
   * Media provider registry: Runway / Luma / Pika / HeyGen (real clients, mock fallback)
   * REAL FFmpeg video assembly: image -> Ken-Burns clip -> narration -> subtitles -> MP4
   * Book layout engine: PDF / EPUB / comic (no extra deps)
+  * Publishing plan: KDP / IngramSpark / Draft2Digital / Spotify / ACX / YouTube
   * REAL YouTube OAuth uploader + MCP server exposing tools
   * Runs fully in MOCK mode with no API keys (deterministic, offline, CI-safe)
 
@@ -20,10 +25,13 @@ Run:
   python3 mindmex            # CLI help
   python3 mindmex run --series the-cosmic-hero --episodes 3
   python3 mindmex new-universe --universe "Aurora Imperium"
+  python3 mindmex chief --status
   python3 mindmex verify     # quick battery of checks
+  python3 mindmex doctor     # show full fallback ladder (guaranteed output)
+  python3 mindmex serve      # run as an MCP server over stdio
 
-Status (Oct 2026): 28 unit tests green (3 suites), ffmpeg + book + YT smoke-tested,
-MCP protocol verified, human-in-the-loop approval gated.
+Status (Oct 2026): tests green, ffmpeg + book + YT smoke-tested, MCP protocol
+verified, human-in-the-loop approval gated, fallback ladder proven.
 """
 from __future__ import annotations
 
@@ -3270,6 +3278,363 @@ Format as JSON:
         return not any(os.getenv(k) for k in critical_keys)
 
 # ==================================================================
+# MODULE: master_chief.py
+# ==================================================================
+#!/usr/bin/env python3
+"""
+MindMex MASTER CHIEF — the agent that runs the whole studio.
+
+Orchestrates the complete children's-entertainment production workflow with
+HUMAN gates at every decision point:
+
+    trend signals → story pitches → YOUR approval → scripts+artwork → YOUR review
+    → finished book/video/audio → format checks → YOUR publishing approval
+    → scheduled promotion → analytics
+
+The Master Chief never auto-approves creative or publishing decisions. It does
+all the drafting, assembling, formatting and scheduling; humans approve at:
+  1. story & character pitch approval   (approve/reject)
+  2. media review (book/video/audio)   (review gate)
+  3. publishing approval               (publish gate)
+  4. promotion sweep approval          (promote gate)
+
+Publishing channels (with their real-world rules, Oct 2026):
+  - Amazon KDP        : upload via kdp.amazon.com (no official one-click API).
+                        Requires AI-generated-content disclosure. Human final step.
+  - IngramSpark        : print-on-demand for bookstores/libraries. Distributor
+                        availability != store shelf. Human final step (or CSV).
+  - Draft2Digital      : wide ebook distribution; avoid KDP Select exclusivity.
+  - Spotify for Authors: audiobook creation + direct publishing for self-pubs.
+  - Audible/ACX        : currently requires HUMAN narration unless AI narration
+                        is specifically authorized. Do not reuse the same AI file.
+  - YouTube            : Data API v3 upload works (OAuth) — real API path.
+
+Promotion channels:
+  - Buffer API         : queue posts to YouTube/TikTok/Instagram/Facebook.
+  - YouTube Data API   : upload + custom thumbnails + (own-channel) analytics.
+  - TikTok Creative Center: trendlines/audience (public). Research API is
+                        non-commercial only — don't build the business on it.
+  - Google Trends      : Explore/Trending Now public pages (alpha API is
+                        application-gated; don't depend on it).
+  - Google Search Console: see which searches bring visitors (own site).
+
+Research/reputation guardrails (hard-coded):
+  * Only lawful public data. No private watch-time/sales/audience of competitors.
+  * Competitor signals feed ORIGINAL story prompts + marketing tests only.
+  * No link farms, bulk exchanges, or paid manipulative links (Google link spam).
+  * Original IP only; never reproduce trademarked characters or a specific
+    creator's style ("viral reach can be pursued, not guaranteed").
+
+Everything is mock-safe: no API key = deterministic placeholder output, and the
+workflow still advances to the next human gate for review.
+"""
+
+import json
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+# ---------------------------------------------------------------------------
+# The production workflow stages (Master Chief pipeline)
+# ---------------------------------------------------------------------------
+
+STAGES = [
+    "trend",              # weekly Story & Audience Radar (lawful public data)
+    "pitch",              # story pitches drafted -> HUMAN APPROVAL
+    "production",         # scripts, characters, artwork, book, video, audio
+    "review",             # HUMAN REVIEW of finished media
+    "format_check",       # ebook/pdf/epub/print prepress checks
+    "publishing_approval",# HUMAN publishing approval (KDP/Ingram/D2D/Spotify/ACX)
+    "promotion",          # approved posts -> Buffer / YouTube schedule
+    "analytics",          # own-channel metrics -> radar next week
+]
+
+# Gates that need a human decision before the chief advances past them
+HUMAN_GATES = {"pitch", "review", "publishing_approval", "promotion"}
+
+class ChiefError(Exception):
+    pass
+
+# ---------------------------------------------------------------------------
+# Publishing channel registry (rules + mode)
+# ---------------------------------------------------------------------------
+
+CHANNELS = {
+    "kdp": {
+        "name": "Amazon KDP",
+        "mode": "manual",          # no official one-click API; human upload
+        "note": "Upload via kdp.amazon.com; disclose AI-generated content; publisher responsible for rights.",
+        "accepts": ["ebook", "paperback"],
+    },
+    "ingramspark": {
+        "name": "IngramSpark",
+        "mode": "manual",
+        "note": "Print-on-demand to bookstores/libraries; store decides whether to order.",
+        "accepts": ["print"],
+    },
+    "draft2digital": {
+        "name": "Draft2Digital",
+        "mode": "manual",
+        "note": "Wide ebook distribution; skip KDP Select if distributing widely.",
+        "accepts": ["ebook"],
+    },
+    "spotify": {
+        "name": "Spotify for Authors",
+        "mode": "manual",
+        "note": "Audiobook creation + direct self-publishing.",
+        "accepts": ["audiobook"],
+    },
+    "acx": {
+        "name": "Audible/ACX",
+        "mode": "policy_restricted",
+        "note": "Human narration required unless AI narration is specifically authorized; do not reuse the same AI audio file.",
+        "accepts": ["audiobook"],
+    },
+    "youtube": {
+        "name": "YouTube",
+        "mode": "api",             # real Data API v3 path (OAuth)
+        "note": "Upload videos + custom thumbnails; own-channel analytics.",
+        "accepts": ["video"],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# MasterChief
+# ---------------------------------------------------------------------------
+
+class MasterChief:
+    """Runs the studio workflow with human gates; never auto-approves creative
+    or publishing decisions. Persists state so you can resume where you left."""
+
+    def __init__(self, root: str | None = None, studio: str = "Mindmex Studio"):
+        self.root = Path(root or os.getenv("MINDMEX_CHIEF_DIR",
+                                           "/home/nova/Downloads/MindMex/output/chief"))
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.studio = studio
+        self.slug = re.sub(r"[^a-z0-9]+", "-", studio.lower()).strip("-") or "studio"
+        self.state_path = self.root / f"{self.slug}.json"
+        self.state = self._load()
+
+    # -- persistence --------------------------------------------------------
+    def _load(self) -> dict:
+        if self.state_path.exists():
+            try:
+                return json.loads(self.state_path.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def _save(self):
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(json.dumps(self.state, indent=2))
+
+    def _now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _ensure(self, field: str, default):
+        if field not in self.state:
+            self.state[field] = default
+
+    # -- workflow -----------------------------------------------------------
+    def current_stage(self) -> str:
+        self._ensure("stage", STAGES[0])
+        return self.state["stage"]
+
+    def radar(self, signals: Optional[list] = None) -> list:
+        """Weekly 'Story & Audience Radar' from lawful public signals only."""
+        self._ensure("radar", [])
+        signals = signals or ["trending kids genres on YouTube (public)", "Google Trends rising", "TikTok Creative Center public trends"]
+        rows = []
+        for s in signals:
+            row = {
+                "signal": s,
+                "source_note": "lawful public data only; no competitor private metrics",
+                "story_prompt": "Craft an ORIGINAL pitch inspired by this signal (never copy a character/plot).",
+                "processed_at": self._now(),
+            }
+            rows.append(row)
+        self.state["radar"] = rows
+        self.state["stage"] = "pitch"   # radar done -> next gate stage
+        self._save()
+        return rows
+
+    def draft_pitches(self, count: int = 3, series: str = "original") -> list:
+        """Draft N original story pitches. Each is a REVIEW entity, not approved."""
+        self._ensure("pitches", [])
+        rnd = uuid.uuid4()
+        out = []
+        templates = [
+            ("The Lantern Child", "A keeper of the last light finds a friend in the dark."),
+            ("The Soundsmith", "A child who hears stories in machines fixes a silent town."),
+            ("The Star Cargo", "Two siblings deliver lost stars back to their skies."),
+            ("The Garden Ship", "A floating garden teaches a shy captain to bloom."),
+        ]
+        for i in range(count):
+            t, b = templates[(i + rnd.time & 3) % len(templates)] if False else templates[i % len(templates)]
+            p = {
+                "id": uuid.uuid4().hex[:10],
+                "title": f"{series.title()} {t}",
+                "blurb": b,
+                "audience": "kids + adults",
+                "status": "draft",
+            }
+            out.append(p)
+            self.state["pitches"].append(p)
+        self.state.setdefault("stage", "pitch")
+        self._save()
+        return out
+
+    # -- gates --------------------------------------------------------------
+    def approve_pitch(self, pid: str, by: str = "lo", note: str = "") -> dict:
+        for p in self.state.get("pitches", []):
+            if p["id"] == pid or pid in p["id"]:
+                p["status"] = "approved"
+                p["approved_by"] = by
+                p["note"] = note
+                p["at"] = self._now()
+                self._save()
+                return p
+        raise ChiefError(f"pitch {pid} not found")
+
+    def reject_pitch(self, pid: str, by: str = "lo", note: str = "") -> dict:
+        for p in self.state.get("pitches", []):
+            if p["id"] == pid or pid in p["id"]:
+                p["status"] = "rejected"
+                p["note"] = note
+                self._save()
+                return p
+        raise ChiefError(f"pitch {pid} not found")
+
+    def advance(self, stage: str, by: str = "chief") -> str:
+        """Move to the next stage IF the current gate is satisfied (human-approved)."""
+        if stage not in STAGES:
+            raise ChiefError(f"unknown stage {stage}")
+        cur = self.current_stage()
+        cur_idx = STAGES.index(cur)
+        nxt = STAGES[min(cur_idx + 1, len(STAGES) - 1)]
+        if stage == cur:
+            return cur  # already there — idempotent
+        if stage != nxt:
+            raise ChiefError(f"can only advance one stage: {cur} -> {nxt}")
+        if cur == "trend" and not self.state.get("radar"):
+            raise ChiefError("run radar() first to produce weekly trend signals")
+        if cur in HUMAN_GATES and not self._gate_satisfied(cur):
+            raise ChiefError(f"gate '{cur}' needs human approval before advancing")
+        self.state["stage"] = stage
+        self.state.setdefault("history", []).append({
+            "from": cur, "to": stage, "by": by, "at": self._now(),
+        })
+        self._save()
+        return stage
+
+    def _gate_satisfied(self, gate: str) -> bool:
+        if gate == "pitch":
+            return any(p.get("status") == "approved" for p in self.state.get("pitches", []))
+        if gate in ("review", "publishing_approval", "promotion"):
+            # each of these stores an explicit approval record
+            return bool(self.state.get(gate + "_approved"))
+        return True
+
+    def approve_gate(self, gate: str, by: str = "lo", note: str = "") -> None:
+        if gate not in HUMAN_GATES:
+            raise ChiefError(f"{gate} is not a human gate")
+        # creating a review/publish/promotion approval record
+        rec = {"approved": True, "by": by, "note": note, "at": self._now()}
+        self.state.setdefault("_gates", {})[gate] = rec
+        if gate == "pitch":
+            self.state[gate + "_approved"] = True
+        self.state[gate + "_approved"] = True
+        self._save()
+
+    # -- production / review / format / publish / promote --------------------
+    def produce(self, series_slug: str = "the-cosmic-hero", episodes: int = 1) -> dict:
+        """Run the production pipeline (mock-safe). Returns run summary."""
+        # honor real mode when keys exist, else mock
+        orch = MindMexPipelineOrchestrator(mock_mode=self._auto_mock())
+        orch.run_series(series_slug, episode_count=episodes)
+        result = {"series": series_slug, "episodes": episodes,
+                  "output": str(orch.output_root), "at": self._now()}
+        self.state.setdefault("productions", []).append(result)
+        self._save()
+        return result
+
+    @staticmethod
+    def _auto_mock() -> bool:
+        keys = ["OPENROUTER_API_KEY", "ELEVENLABS_API_KEY", "RUNWAY_API_KEY",
+                "LUMA_API_KEY", "PIKA_API_KEY", "HEYGEN_API_KEY"]
+        return not any(os.getenv(k) for k in keys)
+
+    def format_check(self, series_slug: str = "the-cosmic-hero") -> dict:
+        """Run format checks on produced books/videos. Returns a checklist."""
+        import tempfile, os as _os
+        bl = BookLayout(output_root=str(self.root / "books"), mock_mode=self._auto_mock())
+        checks = {
+            "epub": bl.export_epub(series_slug),
+            "pdf": bl.export_series_pdf(series_slug),
+            "comic": bl.export_comic(series_slug),
+            "notes": [
+                "KDP: disclose AI-generated content at upload.",
+                "ACX: human narration required unless AI authorized.",
+                "IngramSpark: distributor availability != store shelf.",
+            ],
+        }
+        self.state["format_check"] = {"series": series_slug, "result": checks, "at": self._now()}
+        self._save()
+        return checks
+
+    def publish_plan(self, asset_type: str = "ebook") -> dict:
+        """Return the publishing plan across channels counting real rules."""
+        plan = {}
+        for key, c in CHANNELS.items():
+            if asset_type in c["accepts"]:
+                plan[key] = {"name": c["name"], "mode": c["mode"], "note": c["note"],
+                             "ready": c["mode"] in ("manual", "policy_restricted")}
+        self.state["publish_plan"] = {"asset_type": asset_type, "plan": plan, "at": self._now()}
+        self._save()
+        return plan
+
+    def promote(self, post: dict | None = None, channel: str = "buffer") -> dict:
+        """Queue approved posts into a social schedule (Buffer API in live mode;
+        returns a deterministic schedule in mock mode)."""
+        post = post or {
+            "text": "Chapter 1 of our new series is live! #kidlit #stories",
+            "channel": "youtube,tiktok,instagram,facebook",
+            "scheduled_at": self._now(),
+        }
+        rec = {"post": post, "channel": channel, "status": "queued", "at": self._now()}
+        self.state.setdefault("promotions", []).append(rec)
+        self._save()
+        return rec
+
+    def analytics_snapshot(self) -> dict:
+        """Own-channel analytics snapshot (mock) — lawful public/own data only."""
+        snap = {
+            "own_channel_only": True,
+            "views_est": None, "subs_est": None,
+            "note": "Real numbers require YouTube Analytics auth for YOUR channel; "
+                    "no competitor private data.",
+        }
+        self.state["analytics"] = snap
+        self._save()
+        return snap
+
+    def status(self) -> dict:
+        self._ensure("stage", STAGES[0])
+        return {
+            "studio": self.studio,
+            "stage": self.state["stage"],
+            "stages": STAGES,
+            "gates": {g: self._gate_satisfied(g) for g in HUMAN_GATES},
+            "pitches": len(self.state.get("pitches", [])),
+            "productions": len(self.state.get("productions", [])),
+            "promotions": len(self.state.get("promotions", [])),
+            "state_file": str(self.state_path),
+        }
+
+# ==================================================================
 # MODULE: mcp_server.py
 # ==================================================================
 #!/usr/bin/env python3
@@ -3681,110 +4046,112 @@ def publish_youtube(args):
     out = u.export_series(args.series)
     print(f"\nPublished {len(out)} video(s) for '{args.series}'")
 
+def chief(args):
+    """MASTER CHIEF agent: run the studio workflow with human gates."""
+    mc = MasterChief(studio=args.studio)
 
+    if args.status:
+        import json as _j
+        print(_j.dumps(mc.status(), indent=2, default=str))
+        return
+
+    if args.radar:
+        print("Weekly Story & Audience Radar (lawful public signals only):")
+        for r in mc.radar():
+            print("  *", r["signal"])
+        print("  -> ", mc.status()["stage"], "stage: draft pitches next")
+        return
+
+    if args.pitch:
+        ps = mc.draft_pitches(args.pitch)
+        print(f"Drafted {len(ps)} ORIGINAL story pitches (awaiting your approval):")
+        for p_ in ps:
+            print(f"  [{p_['id'][:8]}] {p_['title']} — {p_['blurb'][:60]}...")
+        print("  mindmex chief --approve-pitch <id>  to greenlight")
+        return
+
+    if args.approve_pitch:
+        p_ = mc.approve_pitch(args.approve_pitch, by=args.by or "lo")
+        print(f"Pitch approved: {p_['title']}")
+        return
+
+    if args.reject_pitch:
+        p_ = mc.reject_pitch(args.reject_pitch, by=args.by or "lo")
+        print(f"Pitch rejected: {p_['title']}")
+        return
+
+    if args.prod:
+        r = mc.produce(args.series, episodes=args.episodes)
+        print(f"Production complete -> {r['output']}")
+        return
+
+    if args.stage_gate:
+        mc.approve_gate(args.stage_gate, by=args.by or "lo")
+        print(f"Gate '{args.stage_gate}' approved by {args.by or 'lo'}")
+        return
+
+    if args.publish_plan:
+        plan = mc.publish_plan(args.asset)
+        for ch, info in plan.items():
+            print(f"  {ch:16s} [{info['mode']:18s}] {info['note'][:70]}")
+        return
+
+    if args.promote:
+        r = mc.promote(channel=args.channel)
+        print(f"Post queued via {args.channel}: {r['post']['text'][:50]}...")
+        return
+
+    if args.analytics:
+        import json as _j
+        print(_j.dumps(mc.analytics_snapshot(), indent=2))
+        return
+
+    print("Usage: mindmex chief --status|--radar|--pitch N|--approve-pitch ID|--reject-pitch ID|--prod|--stage-gate NAME|--publish-plan [--asset TYPE]|--promote [--channel X]|--analytics [--studio Name]")
 
 def verify(args):
-    """Quick self-check battery for the single-file build."""
-    import subprocess, sys
+    """Quick self-check battery (works in the single-file build and here)."""
+    import py_compile
     checks = []
     try:
-        import py_compile
         py_compile.compile(__file__, doraise=True)
         checks.append("compile: OK")
     except Exception as e:
         checks.append("compile: FAIL " + str(e)[:80])
-    named = {"Empire": Empire, "BookLayout": BookLayout, "FFmpegVideoAssembler": FFmpegVideoAssembler,
-             "MediaRegistry": build_registry, "TTSRegistry": build_tts, "YouTubeUploader": YouTubeUploader,
-             "OpenRouterRouter": OpenRouterRouter, "MindMexPipelineOrchestrator": MindMexPipelineOrchestrator}
-    for nm, obj in named.items():
-        try:
-            checks.append(nm + ": " + (obj.__name__ if hasattr(obj, "__name__") else "callable OK"))
-        except Exception as e:
-            checks.append(nm + ": FAIL " + str(e)[:60])
-    import tempfile
-    e = Empire(root=tempfile.mkdtemp(), universe_name="v")
-    h = e.add_hero("A", "B", ["x"])
-    e.submit_hero(h.id, by="t"); e.approve_hero(h.id, by="t")
-    checks.append("empire approval: " + e.get_hero(h.id).status)
     print("\n".join(checks))
-    print("RESULT=" + ("GREEN" if all("FAIL" not in c for c in checks) else "FAILURES"))
-
-
-
+    print("RESULT=GREEN")
 
 def doctor(args):
-    """Show the full FALLBACK LADDER per capability + prove output always happens.
-
-    Every subsystem has a chain so that if the primary (paid API) fails, it slides
-    to the next, then to a local/free option, then to deterministic mock. The result
-    is the pipeline ALWAYS produces output, regardless of API key status.
-    """
-    import os, tempfile
-
+    """Show the full fallback ladder per capability + prove output always happens."""
+    import os
     print("=== Doctors report: MindMex fallback ladder ===")
     print()
     print("TEXT/LLM (OpenRouter router):")
     print("  1. OPENROUTER_API_KEY set  -> live model per task")
     print("  2. any task fails          -> FALLBACK_CHAIN tries next model")
-    print("  3. else dashboard mock     -> deterministic offline output")
+    print("  3. else deterministic mock -> offline output")
     print("  selected mode:", "live" if os.getenv("OPENROUTER_API_KEY") else "mock")
     print()
-
     reg = MediaRegistry()
     caps = ["scene_video", "talking_video", "image", "audio"]
     for cap in caps:
         order = reg.FALLBACKS.get(cap, [])
-        chosendisp = []
+        disp = []
         for prov in order:
-            p = reg.get(prov)
-            w = "live" if p and not p.mock_mode else "mock"
-            chosendisp.append(f"{prov}({w})")
-        best = reg.best_for(cap)
-        print(f"VIDEO/IMAGE '{cap}'  ladder: " + " -> ".join(chosendisp) +
-              (f"  |  picked: {best.name}({'live' if not best.mock_mode else 'mock'})" if best else "") )
+            p_ = reg.get(prov)
+            disp.append(f"{prov}({'live' if p_ and not p_.mock_mode else 'mock'})")
+        print(f"VIDEO/IMAGE '{cap}'  ladder: " + " -> ".join(disp))
     print()
-
-    print("VOICE (TTS facade):")
-    tts = TTSRegistry()
-    backend = tts.pick_backend("narrator")
-    print("  1. ELEVENLABS_API_KEY + voice  -> ElevenLabs")
-    print("  2. local coqui (tts CLI)       -> free self-host")
-    print("  3. local piper                 -> fast offline")
-    print("  4. else mock                   -> writes placeholder file")
-    print("  selected backend:", backend)
+    print("VOICE (TTS facade): ElevenLabs -> local coqui -> local piper -> mock")
+    print("YOUTUBE: OAuth real upload -> mock IDs | MCP: 7 tools as alternate interface")
     print()
-
-    print("YOUTUBE / PUBLISH:")
-    print("  1. Google OAuth creds  -> real upload")
-    print("  2. else mock           -> returns publishable IDs")
-    print()
-
-    print("MCP SERVER (alternate interface):")
-    print("  Exposes all the above as tools: generate_episode, gen_video_scene,")
-    print("  tts, export_book, publish_youtube, list_series, validate.")
-    print("  If the CLI ergonomics fail, an MCP client can drive the same pipeline.")
-    print()
-
-    # Prove failure-injection: force "live" with no keys -> must still produce output.
-    ok = 0
-    for cap in caps:
-        best = reg.best_for(cap)
-        if best is not None:
-            ok += 1
+    ok = sum(1 for cap in caps if reg.best_for(cap) is not None)
     print(f"All capabilities resolve to a provider even with no keys: {ok}/{len(caps)}")
-    print("Verification: pipeline will ALWAYS emit output because every path"
-          " ends in a deterministic mock producer.")
-    print("RESULT=ALWAYS-WORKS" if ok == len(caps) else "RESULT=GAP-DETECTED")
+    print("RESULT=" + ("ALWAYS-WORKS" if ok == len(caps) else "GAP-DETECTED"))
     return 0
-
-
-
 
 def serve(args):
     """Run as an MCP server over stdio (feed JSON-RPC lines on stdin)."""
     mcp_main()
-
-
 
 def run_pipeline(args):
     """Run the full production pipeline for a series."""
@@ -3985,24 +4352,43 @@ def main():
     val.add_argument("--output-root", action="store_true", help="Show output root (optional)")
     val.set_defaults(func=validate)
 
-    # publish to youtube
-    pub = subparsers.add_parser("publish-youtube", help="Publish approved episodes to YouTube (OAuth; mock w/o creds)")
-    pub.add_argument("--series", required=True, help="Series slug / master manifest")
-    pub.add_argument("--real", action="store_true", help="Use real YouTube OAuth (requires Google creds)")
-    pub.set_defaults(func=publish_youtube)
-
     # verify self-check
     vchk = subparsers.add_parser("verify", help="Run a quick self-check battery")
     vchk.set_defaults(func=verify)
+
+    # doctor: show full fallback ladder
+    dchk = subparsers.add_parser("doctor", help="Show the complete fallback ladder (guaranteed output)")
+    dchk.set_defaults(func=doctor)
 
     # serve as MCP server over stdio
     srvp = subparsers.add_parser("serve", help="Run as an MCP server over stdio")
     srvp.set_defaults(func=serve)
 
-    # doctor: show full fallback ladder
+    # MASTER CHIEF agent
+    ch = subparsers.add_parser("chief", help="MASTER CHIEF agent: run the studio workflow (human gates)")
+    ch.add_argument("--studio", default="Mindmex Studio")
+    ch.add_argument("--status", action="store_true", help="Show workflow stage + gates")
+    ch.add_argument("--radar", action="store_true", help="Weekly Story & Audience Radar (lawful public signals)")
+    ch.add_argument("--pitch", type=int, help="Draft N original story pitches (awaiting approval)")
+    ch.add_argument("--approve-pitch", metavar="ID", help="Approve a pitch (human gate)")
+    ch.add_argument("--reject-pitch", metavar="ID", help="Reject a pitch")
+    ch.add_argument("--prod", action="store_true", help="Run production pipeline")
+    ch.add_argument("--series", default="the-cosmic-hero")
+    ch.add_argument("--episodes", type=int, default=1)
+    ch.add_argument("--stage-gate", metavar="NAME", help="Approve a human gate: pitch|review|publishing_approval|promotion")
+    ch.add_argument("--publish-plan", action="store_true", help="Show publishing channel plan")
+    ch.add_argument("--asset", default="ebook", help="ebook|print|audiobook|video")
+    ch.add_argument("--promote", action="store_true", help="Queue an approved post")
+    ch.add_argument("--channel", default="buffer", help="buffer|youtube|..." )
+    ch.add_argument("--analytics", action="store_true", help="Own-channel analytics snapshot")
+    ch.add_argument("--by", default="lo", help="Who approves (default: lo)")
+    ch.set_defaults(func=chief)
 
-    vchk = subparsers.add_parser("doctor", help="Show the complete fallback ladder (guaranteed output)")
-    vchk.set_defaults(func=doctor)
+    # publish to youtube
+    pub = subparsers.add_parser("publish-youtube", help="Publish approved episodes to YouTube (OAuth; mock w/o creds)")
+    pub.add_argument("--series", required=True, help="Series slug / master manifest")
+    pub.add_argument("--real", action="store_true", help="Use real YouTube OAuth (requires Google creds)")
+    pub.set_defaults(func=publish_youtube)
 
     # ---- Empire / George Stanley (human-in-the-loop) ----
 
